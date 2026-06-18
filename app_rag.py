@@ -32,7 +32,6 @@ COLLECTION_NAME = "rag_pdf_collection"
 # LLM_MODEL_ID = "microsoft/Phi-4-mini-instruct"
 # LLM_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 # EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-# EMBEDDING_MODEL_ID = "BAAI/bge-large-en-v1.5"
 LLM_MODEL_ID = os.getenv("HF_CHAT_MODEL_ID", "microsoft/Phi-4-mini-instruct")
 EMBEDDING_MODEL_ID = os.getenv("HF_EMBEDDING_MODEL_ID", "BAAI/bge-large-en-v1.5")
 MAX_NEW_TOKENS = int(os.getenv("HF_MAX_NEW_TOKENS", "512"))
@@ -59,7 +58,6 @@ def build_documents(pdf_files: list[Path]) -> list[Document]:
 def clean_document_content(documents: list[Document]) -> list[Document]:
     """Remove headers/footers de impressão e URLs dos documentos"""
     import re
-    print("DEBUG: start clenaning documents...")
     
     for doc in documents:
         content = doc.page_content
@@ -71,19 +69,12 @@ def clean_document_content(documents: list[Document]) -> list[Document]:
         content = re.sub(r'https?://[^\s]+', '', content)
         
         # Remove padrões como "L13709compilado"
-        # content = re.sub(r'^[A-Z]\d+[a-z]+\s*', '', content, flags=re.MULTILINE)
-        
-        # Remove múltiplos espaços em branco
-        # content = re.sub(r'\s+', ' ', content)
-        
-        # Remove linhas muito curtas que parecem ser artefatos
-        # lines = content.split('\n')
-        # lines = [line.strip() for line in lines if line.strip() and len(line.strip()) > 3]
+        # content = re.sub(r'L\d+compilado', '', content)
+        content = re.sub(r'L13709compilado', '', content)
         
         # doc.page_content = '\n'.join(lines)
         doc.page_content = content
-    
-    print("DEBUG: Done.")
+
     return documents
 
 def split_documents_1(documents: list[Document]) -> list[Document]:
@@ -124,8 +115,16 @@ def split_documents(documents: list[Document]) -> list[Document]:
 
 
 def docs_to_string(docs: list[Document]) -> str:
-    return "\n\n".join(doc.page_content for doc in docs)
+    # return "\n\n".join(doc.page_content for doc in docs)
+    formated_doclist = ""
+    for idx, doc in enumerate(docs, 1):
+        source = doc.metadata.get("source", "N/A")
+        arquivo = Path(source).name if source and source != "N/A" else "N/A"
+        formated_doclist += f"<documento fonte='{arquivo}' pagina='{doc.metadata.get('page', 'N/A')}'>\n"
+        formated_doclist += f"{doc.page_content}\n"
+        formated_doclist += "</documento>\n\n"
 
+    return formated_doclist
 
 def build_pdf_signature(pdf_files: list[Path]) -> str:
     signature_base = "|".join(
@@ -195,9 +194,12 @@ def load_embeddings() -> HuggingFaceEmbeddings:
 def build_vector_store(pdf_signature: str, pdf_paths: tuple[str, ...]) -> Chroma:
     del pdf_signature
     pdf_files = [Path(path) for path in pdf_paths]
+    print("DEBUG: building documents...")
     documents = build_documents(pdf_files)
     documents = clean_document_content(documents)
+    print("DEBUG: spliting documents...")
     splits = split_documents(documents)
+    print("DEBUG: loading embeddings...")
     embeddings = load_embeddings()
 
     vector_store = Chroma(
@@ -218,29 +220,32 @@ def build_vector_store(pdf_signature: str, pdf_paths: tuple[str, ...]) -> Chroma
 def create_rag_chain(vector_store: Chroma, chat_history: StreamlitChatMessageHistory):
     llm = load_llm()
 
-    # (
-    #     "system",
-    #     "Voce e um assistente que responde apenas com base no contexto recuperado dos PDFs. "
-    #     "Responda sempre em portugues, de forma clara e objetiva. "
-    #     "Se a resposta nao estiver no contexto, diga isso explicitamente.",
-    # ),
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "Voce e um assistente que responde apenas com base no contexto recuperado dos PDFs. "
-                "Responda sempre em portugues, de forma clara e objetiva. "
-                "Se a resposta nao estiver no contexto, diga isso explicitamente.",
+                """
+                Você é um assistente de consulta de documentos legais e institucionais. Responda somente com base no conteúdo do "Contexto".
+
+                Regras:
+                1. Use apenas informações explicitamente presentes no contexto. Não use conhecimento externo, não faça inferências nem complemente informações.
+                2. Se a informação não estiver no contexto, responda exatamente:
+                "Não encontrei essa informação nos documentos fornecidos."
+                3. O contexto é dividido em blocos:
+                <documento fonte="..." pagina="...">
+                4. Toda resposta deve citar a fonte e a página exatas do bloco utilizado. Também cite artigos, parágrafos, incisos ou cláusulas quando relevante.
+                5. Não misture informações de documentos diferentes na mesma afirmação. Se usar mais de uma fonte, separe em parágrafos distintos.
+                6. Responda em português, de forma clara, objetiva e tecnicamente precisa.
+
+                Estrutura resumida de leis:
+                Artigo (Art. Xº): unidade principal.
+                Caput: texto principal do artigo.
+                Parágrafo (§): complementa ou cria exceções.
+                Inciso (I, II, III): subdivisão de artigo ou parágrafo.
+                Alínea (a, b, c): subdivisão de inciso.
+                Item (1, 2, 3): detalhamento de alínea.
+                """
             ),
-            # (
-            #     "system",
-            #     'Você é um assistente virtual especialista na análise, interpretação e consulta de textos legais, regulatórios e documentos institucionais. Sua única função é responder às dúvidas do usuário utilizando estritamente as informações fornecidas no "Contexto" abaixo.'
-            #     "Diretrizes de Resposta:"
-            #     "1. Fidelidade Absoluta ao Contexto: Responda APENAS com base nos dados extraídos dos documentos fornecidos. Nunca utilize conhecimento jurídico externo, legislações de fora do texto ou premissas que não estejam explicitamente escritas no contexto."
-            #     '2. Tratamento de Ausência de Informação: Se a resposta não estiver presente ou não puder ser confirmada pelo contexto, responda exatamente: "Não encontrei essa informação nos documentos fornecidos." Não tente adivinhar, fazer analogias ou criar regras.'
-            #     "3. Citação Precisa de Fontes: Como você lida com textos normativos, é obrigatório citar a origem exata da informação presente no contexto sempre que disponível (Ex: mencionar o nome do documento, número da lei, artigo, parágrafo, inciso ou cláusula)."
-            #     "4. Clareza e Rigor Técnico: Responda sempre em português, de forma clara, objetiva e mantendo o rigor técnico adequado ao vocabulário dos documentos originais."
-            # ),
             MessagesPlaceholder(variable_name="history"),
             (
                 "human",
@@ -252,9 +257,11 @@ def create_rag_chain(vector_store: Chroma, chat_history: StreamlitChatMessageHis
     def retrieve_context(payload: dict) -> str:
         question = payload["question"]
         docs = payload.get("docs", [])
+
         print("=============")
         print(docs_to_string(docs))
         print("=============")
+
         return docs_to_string(docs)
 
     chain = {
@@ -321,23 +328,58 @@ with st.spinner("Preparando a base RAG..."):
     )
     print("DEBUG: Done.")
 
-
-for msg in st.session_state.chat_history.messages:
-    st.chat_message(msg.type).write(msg.content)
-
 # Histórico dos documentos recuperados
 if "docs_history" not in st.session_state:
     st.session_state.docs_history = []
+
+def show_docs_history(docs_with_scores):
+    with st.expander("Documentos Recuperados", expanded=False):
+        for idx, (doc, score) in enumerate(docs_with_scores, 1):
+            similarity_pct = (1 - score) * 100
+
+            col1, col2 = st.columns([0.8, 0.2])
+            with col1:
+                st.markdown(
+                    f"**Doc {idx}** | Página {doc.metadata.get('page', 'N/A')}"
+                )
+            with col2:
+                st.metric("Relevância", f"{similarity_pct:.1f}%")
+
+            # st.text(
+            #     doc.page_content[:300] + "..."
+            #     if len(doc.page_content) > 300
+            #     else doc.page_content
+            # )
+            st.text(doc.page_content)
+
+            source = doc.metadata.get("source", "N/A")
+            arquivo = Path(source).name if source and source != "N/A" else "N/A"
+            st.caption(f"Origem: {arquivo}")
+            st.divider()
+
+ai_msg_idx = 0
+for msg in st.session_state.chat_history.messages:
+    with st.chat_message(msg.type):
+        st.write(msg.content)
+        # Se a mensagem for da IA, verifica se existem fontes atreladas a ela no histórico
+        if msg.type == "ai":
+            # Ignora a primeira mensagem de IA (que é apenas o texto fixo de boas-vindas)
+            if ai_msg_idx > 0 and (ai_msg_idx - 1) < len(st.session_state.docs_history):
+                show_docs_history(st.session_state.docs_history[ai_msg_idx - 1])
+            ai_msg_idx += 1
 
 if user_input := st.chat_input("Pergunte algo sobre os PDFs..."):
     st.chat_message("human").write(user_input)
 
     with st.spinner("Buscando resposta nos documentos..."):
         # Buscar documentos AQUI (thread principal do Streamlit)
-        docs_with_scores = st.session_state.vector_store.similarity_search_with_score(user_input, k=5)
+        docs_with_scores = (
+            st.session_state.vector_store.similarity_search_with_score(
+                user_input, k=4
+            )
+        )
         
         config = {"configurable": {"session_id": "rag_streamlit_session"}}
-        # response = conversational_rag_chain.invoke({"question": user_input}, config=config)
         response = conversational_rag_chain.invoke(
             {
                 "question": user_input,
@@ -347,33 +389,10 @@ if user_input := st.chat_input("Pergunte algo sobre os PDFs..."):
         )
         clean_response = response.split("<|im_end|>")[0].strip()
 
-    st.chat_message("ai").write(clean_response)
+    with st.chat_message("ai"):
+        st.write(clean_response)
+        show_docs_history(docs_with_scores)
 
-    # Exibir documentos recuperados
-    with st.expander("Documentos Recuperados", expanded=False):
-        for idx, (doc, score) in enumerate(docs_with_scores, 1):
-            similarity_pct = (1 - score) * 100
-            
-            col1, col2 = st.columns([0.8, 0.2])
-            with col1:
-                st.markdown(f"**Doc {idx}** | Página {doc.metadata.get('page', 'N/A')}")
-            with col2:
-                st.metric("Relevância", f"{similarity_pct:.1f}%")
-            
-            st.text(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
-            # st.text(doc.page_content)
-            
-            # Extrair o arquivo do metadata
-            source = doc.metadata.get('source', 'N/A')
-            if source and source != 'N/A':
-                arquivo = Path(source).name
-            else:
-                arquivo = "N/A"
-            st.caption(f"{arquivo}")
-
-            st.divider()
-
-    # Armazenar docs para reutilização
     st.session_state.docs_history.append(docs_with_scores)
-    
+
     st.rerun()
