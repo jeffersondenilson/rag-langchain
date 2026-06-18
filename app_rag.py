@@ -14,6 +14,7 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
 from transformers import AutoTokenizer, pipeline
+from sentence_transformers import CrossEncoder
 import os
 from dotenv import load_dotenv
 
@@ -34,8 +35,11 @@ COLLECTION_NAME = "rag_pdf_collection"
 # EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 LLM_MODEL_ID = os.getenv("HF_CHAT_MODEL_ID", "microsoft/Phi-4-mini-instruct")
 EMBEDDING_MODEL_ID = os.getenv("HF_EMBEDDING_MODEL_ID", "BAAI/bge-large-en-v1.5")
+RERANKER_MODEL_ID = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 MAX_NEW_TOKENS = int(os.getenv("HF_MAX_NEW_TOKENS", "512"))
 LLM_TEMPERATURE = float(os.getenv("HF_TEMPERATURE", "0.2"))
+DOC_TOP_K = int(os.getenv("HF_DOC_TOP_K", "5"))
+RANK_TOP_K = int(os.getenv("HF_RANK_TOP_K", DOC_TOP_K))
 
 
 st.set_page_config(page_title="RAG com PDFs", page_icon="📚", layout="centered")
@@ -189,6 +193,37 @@ def load_embeddings() -> HuggingFaceEmbeddings:
         encode_kwargs=encode_kwargs,
     )
 
+@st.cache_resource(show_spinner=False)
+def load_reranker() -> CrossEncoder:
+    """Carrega modelo de reranking"""
+    return CrossEncoder(RERANKER_MODEL_ID, device="cpu")
+
+def rerank_documents(query: str, docs_with_scores: list[tuple[Document, float]], top_k: int = 3) -> list[tuple[Document, float]]:
+    """Reordena documentos usando um modelo de cross-encoder"""
+    if not docs_with_scores:
+        return []
+
+    print("DEBUG: loading reranker...")
+    reranker = load_reranker()
+    
+
+    # Preparar pares (query, documento)
+    doc_texts = [doc.page_content for doc, _ in docs_with_scores]
+    pairs = [[query, doc] for doc in doc_texts]
+
+    # Scores do cross-encoder
+    print("DEBUG: Predicting...")
+    scores = reranker.predict(pairs)
+    print("DEBUG: Done.")
+
+    # Reordenar e retornar top_k
+    reranked = sorted(
+        zip(docs_with_scores, scores),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    return [(doc, score) for (doc, _), score in reranked[:top_k]]
 
 @st.cache_resource(show_spinner=False)
 def build_vector_store(pdf_signature: str, pdf_paths: tuple[str, ...]) -> Chroma:
@@ -284,6 +319,7 @@ with st.sidebar:
     st.subheader("Base RAG")
     st.caption(f"LLM Hugging Face: {LLM_MODEL_ID}")
     st.caption(f"Embedding Hugging Face: {EMBEDDING_MODEL_ID}")
+    st.caption(f"Reranker: {RERANKER_MODEL_ID}")
     st.caption(f"Max Tokens: {MAX_NEW_TOKENS} / T: {LLM_TEMPERATURE}")
 
     st.write(f"Pasta monitorada: `{PDF_DIR.name}`")
@@ -335,7 +371,10 @@ if "docs_history" not in st.session_state:
 def show_docs_history(docs_with_scores):
     with st.expander("Documentos Recuperados", expanded=False):
         for idx, (doc, score) in enumerate(docs_with_scores, 1):
-            similarity_pct = (1 - score) * 100
+            # similarity_pct = (1 - score) * 100
+
+            # Score do reranker é um float direto (0-1), não é distance
+            similarity_pct = score * 100 if score <= 1 else min(score, 100)
 
             col1, col2 = st.columns([0.8, 0.2])
             with col1:
@@ -375,8 +414,13 @@ if user_input := st.chat_input("Pergunte algo sobre os PDFs..."):
         # Buscar documentos AQUI (thread principal do Streamlit)
         docs_with_scores = (
             st.session_state.vector_store.similarity_search_with_score(
-                user_input, k=4
+                user_input, k=DOC_TOP_K
             )
+        )
+
+        # ADICIONAR RERANKING
+        docs_with_scores = rerank_documents(
+            user_input, docs_with_scores, top_k=RANK_TOP_K
         )
         
         config = {"configurable": {"session_id": "rag_streamlit_session"}}
