@@ -1,0 +1,6 @@
+.venv
+.env
+RAG FILES/*
+!RAG FILES/.gitkeep
+chroma_db/*
+!chroma_db/.gitkeep
