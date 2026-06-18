@@ -21,18 +21,22 @@ from dotenv import load_dotenv
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 load_dotenv()
-os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
+# os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
 
 BASE_DIR = Path(__file__).resolve().parent
 PDF_DIR = BASE_DIR / "RAG FILES"
 CHROMA_DIR = BASE_DIR / "chroma_db"
 COLLECTION_NAME = "rag_pdf_collection"
-# LLM_MODEL_ID = "LiquidAI/LFM2.5-1.2B-Instruct"
-# LLM_MODEL_ID = "prefeitura-rio/Rio-3.1-Open-4B-Instruct"
-LLM_MODEL_ID = "microsoft/Phi-4-mini-instruct"
+# LLM_MODEL_ID = "microsoft/Phi-4-mini-instruct"
 # LLM_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 # EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-EMBEDDING_MODEL_ID = "BAAI/bge-large-en-v1.5"
+# EMBEDDING_MODEL_ID = "BAAI/bge-large-en-v1.5"
+LLM_MODEL_ID = os.getenv("HF_CHAT_MODEL_ID", "microsoft/Phi-4-mini-instruct")
+EMBEDDING_MODEL_ID = os.getenv("HF_EMBEDDING_MODEL_ID", "BAAI/bge-large-en-v1.5")
+MAX_NEW_TOKENS = int(os.getenv("HF_MAX_NEW_TOKENS", "512"))
+LLM_TEMPERATURE = float(os.getenv("HF_TEMPERATURE", "0.2"))
 
 
 st.set_page_config(page_title="RAG com PDFs", page_icon="📚", layout="centered")
@@ -55,6 +59,7 @@ def build_documents(pdf_files: list[Path]) -> list[Document]:
 def clean_document_content(documents: list[Document]) -> list[Document]:
     """Remove headers/footers de impressão e URLs dos documentos"""
     import re
+    print("DEBUG: start clenaning documents...")
     
     for doc in documents:
         content = doc.page_content
@@ -75,13 +80,14 @@ def clean_document_content(documents: list[Document]) -> list[Document]:
         # lines = content.split('\n')
         # lines = [line.strip() for line in lines if line.strip() and len(line.strip()) > 3]
         
-        lines = content
-        doc.page_content = '\n'.join(lines)
+        # doc.page_content = '\n'.join(lines)
+        doc.page_content = content
     
+    print("DEBUG: Done.")
     return documents
 
 def split_documents_1(documents: list[Document]) -> list[Document]:
-    print("using split_documents")
+    print("DEBUG: using split_documents")
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200,
@@ -90,7 +96,7 @@ def split_documents_1(documents: list[Document]) -> list[Document]:
     return text_splitter.split_documents(documents)
 
 def split_documents(documents: list[Document]) -> list[Document]:
-    print("using split_documents alternative")
+    print("DEBUG: using split_documents alternative")
     # Para documento legal, separadores respeitam hierarquia
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,      # Maior para preservar contexto legal
@@ -131,7 +137,11 @@ def build_pdf_signature(pdf_files: list[Path]) -> str:
 
 @st.cache_resource(show_spinner=False)
 def load_llm() -> HuggingFacePipeline:
-    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_ID)
+    tokenizer = AutoTokenizer.from_pretrained(
+        LLM_MODEL_ID,
+        token=HF_TOKEN,
+        # trust_remote_code=True,
+    )
 
     if torch.backends.mps.is_available():
         device = "mps"
@@ -139,24 +149,33 @@ def load_llm() -> HuggingFacePipeline:
     elif torch.cuda.is_available():
         device = "cuda"
         torch_dtype = torch.bfloat16
-        print("CUDA!")
+        print("DEBUG: CUDA!")
     else:
         device = "cpu"
         torch_dtype = torch.float32
-        print("CPU!")
+        print("DEBUG: CPU!")
+
+    eos_token_ids = [tokenizer.eos_token_id]
+    im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if isinstance(im_end_token_id, int) and im_end_token_id >= 0:
+        eos_token_ids.append(im_end_token_id)
 
     pipe = pipeline(
         "text-generation",
         model=LLM_MODEL_ID,
         tokenizer=tokenizer,
+        token=HF_TOKEN,
+        # trust_remote_code=True,
         dtype=torch_dtype,
         device=device if device != "cuda" else None,
         device_map="auto" if device == "cuda" else None,
-        max_new_tokens=512,
-        temperature=0.1,
+        max_new_tokens=MAX_NEW_TOKENS,
+        temperature=LLM_TEMPERATURE,
         do_sample=True,
         return_full_text=False,
         repetition_penalty=1.1,
+        eos_token_id=eos_token_ids,
+        pad_token_id=tokenizer.eos_token_id,
     )
     return HuggingFacePipeline(pipeline=pipe)
 
@@ -199,6 +218,12 @@ def build_vector_store(pdf_signature: str, pdf_paths: tuple[str, ...]) -> Chroma
 def create_rag_chain(vector_store: Chroma, chat_history: StreamlitChatMessageHistory):
     llm = load_llm()
 
+    # (
+    #     "system",
+    #     "Voce e um assistente que responde apenas com base no contexto recuperado dos PDFs. "
+    #     "Responda sempre em portugues, de forma clara e objetiva. "
+    #     "Se a resposta nao estiver no contexto, diga isso explicitamente.",
+    # ),
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -207,6 +232,15 @@ def create_rag_chain(vector_store: Chroma, chat_history: StreamlitChatMessageHis
                 "Responda sempre em portugues, de forma clara e objetiva. "
                 "Se a resposta nao estiver no contexto, diga isso explicitamente.",
             ),
+            # (
+            #     "system",
+            #     'Você é um assistente virtual especialista na análise, interpretação e consulta de textos legais, regulatórios e documentos institucionais. Sua única função é responder às dúvidas do usuário utilizando estritamente as informações fornecidas no "Contexto" abaixo.'
+            #     "Diretrizes de Resposta:"
+            #     "1. Fidelidade Absoluta ao Contexto: Responda APENAS com base nos dados extraídos dos documentos fornecidos. Nunca utilize conhecimento jurídico externo, legislações de fora do texto ou premissas que não estejam explicitamente escritas no contexto."
+            #     '2. Tratamento de Ausência de Informação: Se a resposta não estiver presente ou não puder ser confirmada pelo contexto, responda exatamente: "Não encontrei essa informação nos documentos fornecidos." Não tente adivinhar, fazer analogias ou criar regras.'
+            #     "3. Citação Precisa de Fontes: Como você lida com textos normativos, é obrigatório citar a origem exata da informação presente no contexto sempre que disponível (Ex: mencionar o nome do documento, número da lei, artigo, parágrafo, inciso ou cláusula)."
+            #     "4. Clareza e Rigor Técnico: Responda sempre em português, de forma clara, objetiva e mantendo o rigor técnico adequado ao vocabulário dos documentos originais."
+            # ),
             MessagesPlaceholder(variable_name="history"),
             (
                 "human",
@@ -218,6 +252,9 @@ def create_rag_chain(vector_store: Chroma, chat_history: StreamlitChatMessageHis
     def retrieve_context(payload: dict) -> str:
         question = payload["question"]
         docs = payload.get("docs", [])
+        print("=============")
+        print(docs_to_string(docs))
+        print("=============")
         return docs_to_string(docs)
 
     chain = {
@@ -238,6 +275,10 @@ pdf_files = list_pdf_files()
 
 with st.sidebar:
     st.subheader("Base RAG")
+    st.caption(f"LLM Hugging Face: {LLM_MODEL_ID}")
+    st.caption(f"Embedding Hugging Face: {EMBEDDING_MODEL_ID}")
+    st.caption(f"Max Tokens: {MAX_NEW_TOKENS} / T: {LLM_TEMPERATURE}")
+
     st.write(f"Pasta monitorada: `{PDF_DIR.name}`")
     if pdf_files:
         st.write(f"PDFs encontrados: {len(pdf_files)}")
@@ -271,14 +312,14 @@ pdf_signature = build_pdf_signature(pdf_files)
 pdf_paths = tuple(str(pdf_file) for pdf_file in pdf_files)
 
 with st.spinner("Preparando a base RAG..."):
-    print("Building vector store...")
+    print("DEBUG: Building vector store...")
     st.session_state.vector_store = build_vector_store(pdf_signature, pdf_paths)
-    print("Create RAG chain...")
+    print("DEBUG: Create RAG chain...")
     conversational_rag_chain = create_rag_chain(
         st.session_state.vector_store,
         st.session_state.chat_history,
     )
-    print("Done.")
+    print("DEBUG: Done.")
 
 
 for msg in st.session_state.chat_history.messages:
@@ -306,6 +347,8 @@ if user_input := st.chat_input("Pergunte algo sobre os PDFs..."):
         )
         clean_response = response.split("<|im_end|>")[0].strip()
 
+    st.chat_message("ai").write(clean_response)
+
     # Exibir documentos recuperados
     with st.expander("Documentos Recuperados", expanded=False):
         for idx, (doc, score) in enumerate(docs_with_scores, 1):
@@ -317,7 +360,7 @@ if user_input := st.chat_input("Pergunte algo sobre os PDFs..."):
             with col2:
                 st.metric("Relevância", f"{similarity_pct:.1f}%")
             
-            st.text(doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content)
+            st.text(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
             # st.text(doc.page_content)
             
             # Extrair o arquivo do metadata
@@ -332,7 +375,5 @@ if user_input := st.chat_input("Pergunte algo sobre os PDFs..."):
 
     # Armazenar docs para reutilização
     st.session_state.docs_history.append(docs_with_scores)
-    
-    st.chat_message("ai").write(clean_response)
     
     st.rerun()
