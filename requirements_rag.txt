@@ -11,5 +11,6 @@ torch
 torchvision
 accelerate
 sentence-transformers
+st-copy
 pypdf
 python-dotenv

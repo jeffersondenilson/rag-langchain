@@ -1,5 +1,5 @@
-- qual a definição de banco de dados?
+qual a definição de banco de dados?
 
-- o que é operador?
+o que é operador?
 
-- quais os direitos do titular?
+quais os direitos do titular?

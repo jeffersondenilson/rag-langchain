@@ -4,6 +4,7 @@ import warnings
 
 import streamlit as st
 import torch
+from torch import nn
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
@@ -17,6 +18,7 @@ from transformers import AutoTokenizer, pipeline
 from sentence_transformers import CrossEncoder
 import os
 from dotenv import load_dotenv
+from st_copy import copy_button
 
 
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
@@ -71,6 +73,9 @@ def clean_document_content(documents: list[Document]) -> list[Document]:
         
         # Remove URLs
         content = re.sub(r'https?://[^\s]+', '', content)
+
+        # Remove sequências de múltiplos pontos
+        content = re.sub(r'\.{2,}', '', content)
         
         # Remove padrões como "L13709compilado"
         # content = re.sub(r'L\d+compilado', '', content)
@@ -206,14 +211,14 @@ def rerank_documents(query: str, docs_with_scores: list[tuple[Document, float]],
     print("DEBUG: loading reranker...")
     reranker = load_reranker()
     
-
     # Preparar pares (query, documento)
     doc_texts = [doc.page_content for doc, _ in docs_with_scores]
     pairs = [[query, doc] for doc in doc_texts]
 
     # Scores do cross-encoder
     print("DEBUG: Predicting...")
-    scores = reranker.predict(pairs)
+    scores = reranker.predict(pairs, activation_fct=nn.Sigmoid())
+    # print("scores", scores)
     print("DEBUG: Done.")
 
     # Reordenar e retornar top_k
@@ -260,7 +265,7 @@ def create_rag_chain(vector_store: Chroma, chat_history: StreamlitChatMessageHis
             (
                 "system",
                 """
-                Você é um assistente de consulta de documentos legais e institucionais. Responda somente com base no conteúdo do "Contexto".
+                Você é um assistente de consulta de documentos legais e institucionais. Responda sobre {lei} somente com base no conteúdo do "Contexto".
 
                 Regras:
                 1. Use apenas informações explicitamente presentes no contexto. Não use conhecimento externo, não faça inferências nem complemente informações.
@@ -300,6 +305,7 @@ def create_rag_chain(vector_store: Chroma, chat_history: StreamlitChatMessageHis
         return docs_to_string(docs)
 
     chain = {
+        "lei": RunnableLambda(lambda _: "Lei Geral de Proteção de Dados Pessoais (LGPD)"),
         "context": RunnableLambda(retrieve_context),
         "question": RunnableLambda(lambda payload: payload["question"]),
         "history": RunnableLambda(lambda payload: payload.get("history", [])),
@@ -384,11 +390,6 @@ def show_docs_history(docs_with_scores):
             with col2:
                 st.metric("Relevância", f"{similarity_pct:.1f}%")
 
-            # st.text(
-            #     doc.page_content[:300] + "..."
-            #     if len(doc.page_content) > 300
-            #     else doc.page_content
-            # )
             st.text(doc.page_content)
 
             source = doc.metadata.get("source", "N/A")
@@ -435,8 +436,16 @@ if user_input := st.chat_input("Pergunte algo sobre os PDFs..."):
 
     with st.chat_message("ai"):
         st.write(clean_response)
+
+        copy_button(
+            clean_response,
+            tooltip='Copiar resposta',
+            copied_label='Copiada!',
+            key=len(st.session_state.docs_history),
+        )
+
         show_docs_history(docs_with_scores)
 
     st.session_state.docs_history.append(docs_with_scores)
 
-    st.rerun()
+    # st.rerun()
